@@ -1,0 +1,2098 @@
+#!/usr/bin/python3
+"""omarchy-pl — Premier League scorecard for Omarchy.
+
+Live scores, league table, fixtures and a kick-off countdown for your club,
+themed from the active Omarchy theme. No API key, stdlib only.
+"""
+
+import json
+import fcntl
+import os
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(HOME, ".config", "omarchy", "premier-league.json")
+CACHE_DIR = os.path.join(HOME, ".cache", "omarchy-pl")
+THEME_COLORS = os.path.join(HOME, ".local/state/omarchy/current/theme/colors.toml")
+STATE_DIR = os.path.join(HOME, ".local", "state", "omarchy-pl")
+GOAL_STATE = os.path.join(STATE_DIR, "goal-state.json")
+GOAL_INBOX = os.path.join(STATE_DIR, "touchbar-goals.jsonl")
+VERSION = "2.2.0"
+
+LEAGUE = "eng.1"
+API = "https://site.api.espn.com/apis"
+PL_API = "https://footballapi.pulselive.com/football"
+
+# Competitions your club can turn up in besides the league. Only matches
+# involving your club are kept from these -- the point is to complete *your*
+# fixture list, not to mirror four more tournaments into the card.
+OTHER_COMPS = {
+    "uefa.champions":    "UCL",
+    "uefa.europa":       "UEL",
+    "uefa.europa.conf":  "UECL",
+    "eng.fa":            "FA Cup",
+    "eng.league_cup":    "EFL Cup",
+    "eng.charity":       "Shield",
+    "uefa.super_cup":    "Super Cup",
+    "fifa.cwc":          "Club WC",
+}
+COMP_LABEL = dict(OTHER_COMPS, **{LEAGUE: "PL"})
+UA = "Mozilla/5.0 (X11; Linux x86_64) omarchy-pl/%s" % VERSION
+MAX_HTTP_BYTES = 2 * 1024 * 1024
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_STATE_BYTES = 512 * 1024
+MAX_INBOX_BYTES = 2 * 1024 * 1024
+ALLOWED_API_HOSTS = {"site.api.espn.com", "footballapi.pulselive.com"}
+NOTIFICATION_BIN = "/usr/share/omarchy/bin/omarchy-notification-send"
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "team": "",           # display name, e.g. "Arsenal"
+    "teamAbbr": "",       # e.g. "ARS"
+    "teamId": "",         # ESPN team id
+    "clock24": True,
+    "timezone": "Asia/Kathmandu",   # "" follows the system clock
+    "tzLabel": "KTM",               # shown beside league-wide kick-off times
+    "liveRefresh": 25,    # seconds, while a match is in progress
+    "idleRefresh": 300,   # seconds, otherwise
+    # Cups and Europe. Set to [] to follow the league only.
+    "competitions": ["uefa.champions", "eng.fa", "eng.league_cup", "uefa.europa"],
+    # Cup fixtures move rarely, and ESPN rate-limits bursts, so these are
+    # cached far longer than the league and refreshed one at a time.
+    "otherCompsTtl": 21600,
+    "resultHours": 8,     # how long the final score stays on the bar
+    "goalAlerts": True,   # queue every newly observed PL goal for the Touch Bar
+}
+
+
+def _entry_name(name):
+    if not name or name in (".", "..") or os.path.basename(name) != name:
+        raise ValueError("unsafe file name")
+
+
+def _user_dirfd(path, create=False):
+    """Open a HOME-relative directory without following mutable ancestors."""
+    home = os.path.abspath(HOME)
+    absolute = os.path.abspath(path)
+    if os.path.commonpath((home, absolute)) != home:
+        raise ValueError("path is outside HOME")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    expected = os.lstat(home)
+    fd = os.open(home, flags)
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+                or opened.st_uid != os.getuid() or opened.st_mode & 0o022):
+            raise ValueError("unsafe HOME directory")
+        for part in os.path.relpath(absolute, home).split(os.sep):
+            if part == ".":
+                continue
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+            info = os.fstat(child)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022):
+                os.close(child)
+                raise ValueError("unsafe user data directory")
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_bytes(path, limit, optional=False):
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    _entry_name(name)
+    try:
+        dirfd = _user_dirfd(parent)
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(name, flags, dir_fd=dirfd)
+        except FileNotFoundError:
+            if optional:
+                return None
+            raise
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError("unsafe regular file: %s" % path)
+            if info.st_size > limit:
+                raise ValueError("file exceeds size limit: %s" % path)
+            chunks, total = [], 0
+            while True:
+                chunk = os.read(fd, min(65536, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("file grew beyond size limit: %s" % path)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def _read_json(path, limit, optional=False):
+    raw = _read_bytes(path, limit, optional)
+    if raw is None:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _atomic_write(path, data, mode=0o600):
+    if len(data) > MAX_HTTP_BYTES:
+        raise ValueError("refusing oversized local write")
+    dirfd = _user_dirfd(os.path.dirname(path), create=True)
+    name = os.path.basename(path)
+    _entry_name(name)
+    temp = ".%s.football.%s.tmp" % (name, secrets.token_hex(12))
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temp, flags, mode, dir_fd=dirfd)
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # Refuse to replace a special file. Regular cache/state files may be
+        # updated by another Football poller; atomic last-writer-wins is safe.
+        try:
+            existing = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                               | getattr(os, "O_NONBLOCK", 0), dir_fd=dirfd)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            try:
+                info = os.fstat(existing)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1 or info.st_mode & 0o022):
+                    raise ValueError("refusing to replace unsafe file: %s" % path)
+            finally:
+                os.close(existing)
+        os.replace(temp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    finally:
+        try:
+            os.unlink(temp, dir_fd=dirfd)
+        except FileNotFoundError:
+            pass
+        os.close(dirfd)
+
+
+def _safe_mtime(path):
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    dirfd = _user_dirfd(parent)
+    try:
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0), dir_fd=dirfd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022
+                    or info.st_size > MAX_HTTP_BYTES):
+                raise ValueError("unsafe cache file")
+            return info.st_mtime
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def _bounded(value, limit):
+    return str(value or "").replace("\x00", "")[:limit]
+
+
+def _objects(value, limit):
+    return [item for item in value[:limit] if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_config(raw):
+    cfg = dict(DEFAULT_CONFIG)
+    if not isinstance(raw, dict):
+        return cfg
+    cfg["team"] = _bounded(raw.get("team"), 100)
+    cfg["teamAbbr"] = _bounded(raw.get("teamAbbr"), 12).upper()
+    cfg["teamId"] = _bounded(raw.get("teamId"), 32)
+    cfg["clock24"] = raw.get("clock24", True) is not False
+    cfg["timezone"] = _bounded(raw.get("timezone", cfg["timezone"]), 100)
+    cfg["tzLabel"] = _bounded(raw.get("tzLabel", cfg["tzLabel"]), 20)
+    for key, low, high in (("liveRefresh", 10, 300), ("idleRefresh", 30, 3600),
+                           ("otherCompsTtl", 600, 604800), ("resultHours", 0, 72)):
+        try:
+            cfg[key] = min(high, max(low, int(raw.get(key, cfg[key]))))
+        except (TypeError, ValueError):
+            pass
+    cfg["competitions"] = [item for item in raw.get("competitions", cfg["competitions"])
+                           if isinstance(item, str) and item in OTHER_COMPS][:8] \
+        if isinstance(raw.get("competitions", cfg["competitions"]), list) else cfg["competitions"]
+    cfg["goalAlerts"] = raw.get("goalAlerts", True) is not False
+    return cfg
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg = _normalize_config(_read_json(CONFIG_PATH, MAX_CONFIG_BYTES, optional=True))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    clean = _normalize_config(cfg)
+    data = (json.dumps(clean, indent=2) + "\n").encode("utf-8")
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ValueError("configuration exceeds size limit")
+    _atomic_write(CONFIG_PATH, data, 0o600)
+
+
+# --------------------------------------------------------------------------
+# theme
+# --------------------------------------------------------------------------
+
+FALLBACK_THEME = {
+    "mode": "dark",
+    "accent": "#7aa2f7", "selection": "#33467c", "muted": "#565f89",
+    "background": "#1a1b26", "dark_background": "#16161e",
+    "darker_background": "#101014", "lighter_background": "#292e42",
+    "foreground": "#c0caf5", "dark_foreground": "#565f89",
+    "light_foreground": "#a9b1d6", "bright_foreground": "#c0caf5",
+    "red": "#f7768e", "yellow": "#e0af68", "orange": "#ff9e64",
+    "green": "#9ece6a", "cyan": "#7dcfff", "blue": "#7aa2f7",
+    "magenta": "#bb9af7", "brown": "#a06d3a",
+}
+
+
+def load_theme():
+    t = dict(FALLBACK_THEME)
+    try:
+        raw = _read_bytes(THEME_COLORS, MAX_CONFIG_BYTES, optional=True) or b""
+        for line in raw.decode("utf-8").splitlines():
+            m = re.match(r'\s*([a-z_]+)\s*=\s*"([^"]*)"', line)
+            if m:
+                t[m.group(1)] = _bounded(m.group(2), 32)
+    except Exception:
+        pass
+    # Themes may omit some keys; backfill from the closest relative.
+    for key, src in (("orange", "yellow"), ("cyan", "blue"), ("brown", "orange"),
+                     ("magenta", "accent"), ("light_foreground", "foreground"),
+                     ("dark_foreground", "muted")):
+        t.setdefault(key, t.get(src, FALLBACK_THEME[key]))
+    return t
+
+
+T = load_theme()
+_THEME_MTIME = 0
+
+
+def refresh_theme():
+    """Follow Omarchy current and future themes without restarting."""
+    global T, _THEME_MTIME
+    try:
+        stamp = int(_safe_mtime(THEME_COLORS) * 1_000_000_000)
+    except Exception:
+        stamp = 0
+    if stamp != _THEME_MTIME:
+        T = load_theme()
+        _THEME_MTIME = stamp
+
+
+def _rgb(h):
+    h = (h or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return (200, 200, 200)
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (200, 200, 200)
+
+
+# Colour is for terminals. Piped or redirected output stays plain text so
+# `omarchy-pl table > file` and notification bodies are readable.
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def fg(h):
+    if not COLOR:
+        return ""
+    r, g, b = _rgb(h)
+    return "\x1b[38;2;%d;%d;%dm" % (r, g, b)
+
+
+def bg(h):
+    if not COLOR:
+        return ""
+    r, g, b = _rgb(h)
+    return "\x1b[48;2;%d;%d;%dm" % (r, g, b)
+
+
+if COLOR:
+    RESET, BOLD, DIM, ITAL = "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[3m"
+else:
+    RESET = BOLD = DIM = ITAL = ""
+
+
+# --------------------------------------------------------------------------
+# http + cache
+# --------------------------------------------------------------------------
+
+class FetchError(Exception):
+    pass
+
+
+def _cache_file(key):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return os.path.join(CACHE_DIR, safe + ".json")
+
+
+def fetch(url, key, ttl, force=False, headers=None):
+    """GET JSON with an on-disk cache. Falls back to stale cache on failure."""
+    cache_fd = _user_dirfd(CACHE_DIR, create=True)
+    os.close(cache_fd)
+    path = _cache_file(key)
+    if not force:
+        try:
+            age = time.time() - _safe_mtime(path)
+            if age < ttl:
+                cached = _read_json(path, MAX_HTTP_BYTES)
+                if isinstance(cached, dict):
+                    return cached
+        except Exception:
+            pass
+    request_headers = {"User-Agent": UA, "Accept": "application/json"}
+    request_headers.update(headers or {})
+    req = urllib.request.Request(url, headers=request_headers)
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in ALLOWED_API_HOSTS:
+            raise FetchError("refusing an unexpected API origin")
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = urllib.parse.urlparse(r.geturl())
+            if final.scheme != "https" or final.hostname not in ALLOWED_API_HOSTS:
+                raise FetchError("API redirected to an unexpected origin")
+            ctype = (r.headers.get_content_type() or "").lower()
+            if ctype not in ("application/json", "text/json"):
+                raise FetchError("API returned non-JSON content")
+            length = r.headers.get("Content-Length")
+            if length is not None and (not length.isdigit() or int(length) > MAX_HTTP_BYTES):
+                raise FetchError("API response is too large")
+            raw = r.read(MAX_HTTP_BYTES + 1)
+            if len(raw) > MAX_HTTP_BYTES:
+                raise FetchError("API response exceeds 2 MiB")
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise FetchError("API response must be a JSON object")
+        encoded = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        _atomic_write(path, encoded, 0o600)
+        return data
+    except Exception as e:
+        try:
+            cached = _read_json(path, MAX_HTTP_BYTES)
+            if not isinstance(cached, dict):
+                raise ValueError("cached response is not an object")
+            return cached
+        except Exception:
+            raise FetchError(str(e))
+
+
+def _ymd(d):
+    return d.strftime("%Y%m%d")
+
+
+def scoreboard(start, end, key, ttl, force=False, league=LEAGUE):
+    url = "%s/site/v2/sports/soccer/%s/scoreboard?dates=%s-%s&limit=400" % (
+        API, league, _ymd(start), _ymd(end))
+    return fetch(url, key, ttl, force)
+
+
+def standings_raw(force=False):
+    url = "%s/v2/sports/soccer/%s/standings" % (API, LEAGUE)
+    return fetch(url, "standings", 900, force)
+
+
+def official_fixtures(force=False):
+    """All 380 fixtures from the Premier League's current season feed."""
+    headers = {"Origin": "https://www.premierleague.com"}
+    seasons_url = "%s/competitions/1/compseasons?page=0&pageSize=20" % PL_API
+    seasons = fetch(seasons_url, "pl-seasons", 604800, force, headers)
+    choices = _objects(seasons.get("content"), 20)
+    if not choices:
+        return []
+    season_id = int(choices[0]["id"])
+    fixtures_url = ("%s/fixtures?comp=1&compSeasons=%d&page=0&pageSize=500"
+                    "&sort=asc&altIds=true") % (PL_API, season_id)
+    data = fetch(fixtures_url, "pl-fixtures-%d" % season_id, 21600, force, headers)
+    return [parse_official_fixture(item) for item in _objects(data.get("content"), 500)]
+
+
+# --------------------------------------------------------------------------
+# data model
+# --------------------------------------------------------------------------
+
+def parse_utc(s):
+    for fmt in ("%Y-%m-%dT%H:%MZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+# ESPN omits team colors on some endpoints; these keep the crest bar meaningful.
+CLUB_COLORS = {
+    "ARS": "#EF0107", "AVL": "#95BFE5", "BOU": "#DA291C", "BRE": "#E30613",
+    "BHA": "#0057B8", "BUR": "#6C1D45", "CHE": "#034694", "CRY": "#1B458F",
+    "EVE": "#003399", "FUL": "#CC0000", "IPS": "#3A64A3", "LEE": "#FFCD00",
+    "LEI": "#003090", "LIV": "#C8102E", "MNC": "#6CABDD", "MNU": "#DA291C", "MAN": "#DA291C",
+    "NEW": "#41B6E6", "NFO": "#DD0000", "SOU": "#D71920", "TOT": "#132257",
+    "WHU": "#7A263A", "WOL": "#FDB913", "SHU": "#EE2737", "LUT": "#F78F1E",
+    "COV": "#78D0F3", "HUL": "#F5A12D", "MID": "#DE1B22", "SUN": "#EB172B",
+    "WBA": "#122F67", "STO": "#E03A3E", "NOR": "#00A650", "WAT": "#FBEE23",
+}
+
+# The two public feeds disagree on Manchester abbreviations. Normalize before
+# merge/deduplication so the full-season feed cannot duplicate an ESPN match.
+ABBR_ALIASES = {"MCI": "MNC", "MUN": "MNU", "MAN": "MNU"}
+
+
+def canonical_abbr(value):
+    abbr = _bounded(value, 12).upper()
+    return ABBR_ALIASES.get(abbr, abbr)
+
+
+def team_color(t):
+    known = CLUB_COLORS.get((t.get("abbreviation") or "").upper())
+    if known:
+        return known
+    c = (t.get("color") or "").strip()
+    if c and c.lower() not in ("000000", "ffffff", "none"):
+        return "#" + c.lstrip("#")
+    return T["accent"]
+
+
+def parse_event(ev, league=LEAGUE):
+    if not isinstance(ev, dict):
+        raise ValueError("event must be an object")
+    competitions = _objects(ev.get("competitions"), 4)
+    comp = competitions[0] if competitions else {}
+    status = _mapping(ev.get("status") or comp.get("status"))
+    stype = _mapping(status.get("type"))
+    home = away = None
+    for c in _objects(comp.get("competitors"), 4):
+        team = _mapping(c.get("team"))
+        side = {
+            "id": _bounded(team.get("id"), 32),
+            "abbr": canonical_abbr(team.get("abbreviation", "???")),
+            "name": _bounded(team.get("shortDisplayName") or team.get("displayName", "?"), 100),
+            "full": _bounded(team.get("displayName", "?"), 100),
+            "score": _bounded(c.get("score"), 12) if c.get("score") is not None else None,
+            "winner": c.get("winner"),
+            "form": _bounded(c.get("form"), 20),
+            "color": team_color(team),
+        }
+        if c.get("homeAway") == "home":
+            home = side
+        else:
+            away = side
+    goals = []
+    for d in _objects(comp.get("details"), 50):
+        if not d.get("scoringPlay"):
+            continue
+        athletes = _objects(d.get("athletesInvolved"), 4)
+        who = athletes[0] if athletes else {}
+        goals.append({
+            "team": _bounded(_mapping(d.get("team")).get("id", ""), 32),
+            "clock": _bounded(_mapping(d.get("clock")).get("displayValue", ""), 20),
+            "player": _bounded(who.get("shortName") or who.get("displayName"), 100),
+            "own": bool(d.get("ownGoal")),
+            "pen": bool(d.get("penaltyKick")),
+        })
+    venue = _mapping(comp.get("venue") or ev.get("venue"))
+    return {
+        "id": _bounded(ev.get("id"), 64),
+        "league": league,
+        "comp": COMP_LABEL.get(league, league),
+        "kickoff": parse_utc(ev.get("date")),
+        "state": stype.get("state", "pre"),        # pre | in | post
+        "detail": _bounded(stype.get("shortDetail"), 100),
+        "clock": _bounded(status.get("displayClock"), 20),
+        "completed": bool(stype.get("completed")),
+        "home": home, "away": away,
+        "goals": goals,
+        "venue": _bounded(venue.get("fullName"), 100),
+        "city": _bounded(_mapping(venue.get("address")).get("city"), 100),
+    }
+
+
+def parse_official_fixture(raw):
+    """Normalize one Premier League fixture into the ESPN-shaped model."""
+    if not isinstance(raw, dict):
+        raise ValueError("fixture must be an object")
+    teams = _objects(raw.get("teams"), 4)
+
+    def team_at(index):
+        entry = teams[index] if index < len(teams) else {}
+        team = _mapping(entry.get("team"))
+        club = _mapping(team.get("club"))
+        return {
+            "id": "pl:%s" % int(team.get("id") or 0),
+            "abbr": canonical_abbr(club.get("abbr") or "?"),
+            "name": _bounded(team.get("shortName") or club.get("shortName") or team.get("name") or "?", 100),
+            "full": _bounded(team.get("name") or club.get("name") or "?", 100),
+            "score": _bounded(entry.get("score"), 12) if entry.get("score") is not None else None,
+            "winner": False, "form": "", "color": "",
+        }
+
+    kickoff = _mapping(raw.get("kickoff") or raw.get("provisionalKickoff"))
+    millis = kickoff.get("millis")
+    when = datetime.fromtimestamp(float(millis) / 1000, timezone.utc) if millis else None
+    ground = _mapping(raw.get("ground"))
+    status = raw.get("status") or "U"
+    return {
+        "id": "pl:%s" % int(raw.get("id") or 0), "league": LEAGUE, "comp": "PL",
+        "kickoff": when, "state": "pre" if status == "U" else ("in" if status == "L" else "post"),
+        "detail": _bounded(status, 20),
+        "clock": _bounded(_mapping(raw.get("clock")).get("label"), 20),
+        "completed": status == "C", "home": team_at(0), "away": team_at(1),
+        "goals": [], "venue": _bounded(ground.get("name"), 100),
+        "city": _bounded(ground.get("city"), 100),
+    }
+
+
+def _is_our_match(e, cfg):
+    tid = str(cfg.get("teamId") or "")
+    abbr = (cfg.get("teamAbbr") or "").upper()
+    for side in ("home", "away"):
+        s = e.get(side) or {}
+        if (tid and s.get("id") == tid) or (abbr and (s.get("abbr") or "").upper() == abbr):
+            return True
+    return False
+
+
+def _other_comp_events(cfg, back, ahead, force=False):
+    """Your club's matches in the cups and in Europe.
+
+    ESPN rate-limits bursts -- a handful of scoreboards fetched back to back
+    returns 403 -- so at most one competition is refreshed per call and the
+    rest are served from cache. With the bar polling every few minutes the
+    whole set stays fresh without ever bursting.
+    """
+    comps = [c for c in (cfg.get("competitions") or []) if c in OTHER_COMPS]
+    if not comps or not (cfg.get("teamId") or cfg.get("teamAbbr")):
+        return []
+
+    ttl = max(600, int(cfg.get("otherCompsTtl") or 21600))
+    now = datetime.now(timezone.utc)
+    start, end = now - timedelta(days=back), now + timedelta(days=ahead)
+
+    # Oldest cache first, so the staggering is fair rather than always the
+    # same competition winning the single refresh slot.
+    def age(c):
+        try:
+            return time.time() - _safe_mtime(_cache_file("comp-" + c))
+        except Exception:
+            return float("inf")
+    order = sorted(comps, key=age, reverse=True)
+    budget = 1 if not force else len(order)
+
+    out = []
+    for c in order:
+        cache_age = age(c)
+        cached = cache_age != float("inf")
+        stale = cache_age >= ttl
+        allow = force or (stale and budget > 0)
+        if allow and not force:
+            budget -= 1
+        # Without this, a first run with no cache would fall through fetch()'s
+        # cache check and hit every competition at once -- which is precisely
+        # the burst ESPN answers with 403. Uncached competitions wait their
+        # turn instead, one per call.
+        if not allow and not cached:
+            continue
+        try:
+            data = scoreboard(start, end, "comp-" + c,
+                              0 if allow else float("inf"), allow, league=c)
+        except Exception:
+            continue                      # one dead cup must not sink the rest
+        for raw in _objects(data.get("events"), 400):
+            e = parse_event(raw, league=c)
+            if e["kickoff"] and e["home"] and e["away"] and _is_our_match(e, cfg):
+                out.append(e)
+    return out
+
+
+def load_events(force=False, back=6, ahead=70, cfg=None):
+    """Live detail plus the full official season and your club's other ties."""
+    now = datetime.now(timezone.utc)
+    data = scoreboard(now - timedelta(days=back), now + timedelta(days=ahead),
+                      "events", 0 if force else 60, force)
+    evs = [parse_event(e) for e in _objects(data.get("events"), 400)]
+    evs = [e for e in evs if e["kickoff"] and e["home"] and e["away"]]
+
+    # ESPN's scoreboard date range is capped to roughly two months. The
+    # Premier League feed supplies the complete 380-match season in one call;
+    # ESPN remains authoritative for overlapping live/recent matches because
+    # it includes clocks, scorers, penalties, and own goals.
+    try:
+        official = [e for e in official_fixtures(force) if e["state"] == "pre" and e["kickoff"]]
+    except Exception:
+        official = []
+    espn_pairs = {(canonical_abbr(e["home"]["abbr"]),
+                   canonical_abbr(e["away"]["abbr"])) for e in evs}
+    evs.extend(e for e in official
+               if (canonical_abbr(e["home"]["abbr"]),
+                   canonical_abbr(e["away"]["abbr"])) not in espn_pairs)
+
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+    try:
+        extra = _other_comp_events(cfg, back, ahead, force)
+    except Exception:
+        extra = []
+    seen = {e["id"] for e in evs}
+    evs.extend(e for e in extra if e["id"] not in seen)
+
+    evs.sort(key=lambda e: e["kickoff"])
+    try:
+        detect_goals(evs, cfg)
+    except Exception:
+        pass                              # alerts must never sink live scores
+    return evs
+
+
+def _goal_key(match, goal, index):
+    return "%s:%s:%s:%s:%s" % (
+        match.get("id", ""), goal.get("team", ""), goal.get("clock", ""),
+        goal.get("player", ""), index)
+
+
+def _goal_payload(match, goal, index):
+    home, away = match["home"], match["away"]
+    scorer_team = home if goal.get("team") == home.get("id") else away
+    # Build the score at this exact goal, rather than showing the final score
+    # for every alert when several goals arrive in one scoreboard refresh.
+    hs = sum(1 for item in (match.get("goals") or [])[:index + 1]
+             if item.get("team") == home.get("id"))
+    aws = sum(1 for item in (match.get("goals") or [])[:index + 1]
+              if item.get("team") == away.get("id"))
+    suffix = " (P)" if goal.get("pen") else (" (OG)" if goal.get("own") else "")
+    return {
+        "id": _goal_key(match, goal, index), "kind": "goal",
+        "event": match.get("id", ""), "competition": match.get("comp", "PL"),
+        "home": home["full"], "homeAbbr": home["abbr"], "homeScore": hs,
+        "away": away["full"], "awayAbbr": away["abbr"], "awayScore": aws,
+        "team": scorer_team["full"], "teamAbbr": scorer_team["abbr"],
+        "teamColor": scorer_team.get("color") or T["accent"],
+        "scorer": (goal.get("player") or "Goal") + suffix,
+        "clock": goal.get("clock") or match.get("clock") or "LIVE",
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def detect_goals(events, cfg=None):
+    """Persist every newly observed PL goal into the Touch Bar inbox.
+
+    The first observation is a baseline, not a flood of old goals. Thereafter
+    both state and inbox are updated under one advisory lock, so simultaneous
+    bar/TUI pollers cannot duplicate or lose an event. The inbox is durable:
+    the Touch Bar can be down and drain it when it returns.
+    """
+    cfg = cfg or load_config()
+    if not cfg.get("goalAlerts", True):
+        return []
+    live = [m for m in events if m.get("league") == LEAGUE and m.get("state") in ("in", "post")]
+    current = {}
+    payloads = []
+    for match in live:
+        for index, goal in enumerate(match.get("goals") or []):
+            key = _goal_key(match, goal, index)
+            current[key] = True
+            payloads.append((key, _goal_payload(match, goal, index)))
+    statefd = _user_dirfd(STATE_DIR, create=True)
+    lock_name = os.path.basename(GOAL_STATE) + ".lock"
+    lock_flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_NONBLOCK", 0))
+    try:
+        lockfd = os.open(lock_name, lock_flags, 0o600, dir_fd=statefd)
+    finally:
+        os.close(statefd)
+    try:
+        info = os.fstat(lockfd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("unsafe goal-state lock")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(lockfd, 0o600)
+        try:
+            fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        try:
+            prior = _read_json(GOAL_STATE, MAX_STATE_BYTES, optional=True)
+        except Exception:
+            prior = None
+        if prior is None:
+            new = []                         # establish the baseline quietly
+        else:
+            seen = set(prior.get("seen") or [])
+            new = [payload for key, payload in payloads if key not in seen][:20]
+        # Keep historical IDs too: a transiently incomplete API response must
+        # not make an old goal look new when it reappears on the next poll.
+        historical = list(dict.fromkeys(list((prior or {}).get("seen") or []) + list(current)))
+        snapshot = {"seen": historical[-2000:], "updated": time.time()}
+        if new:
+            lines = b"".join((json.dumps(payload, ensure_ascii=False,
+                                         separators=(",", ":")) + "\n").encode("utf-8")
+                             for payload in new)
+            inboxfd = _user_dirfd(os.path.dirname(GOAL_INBOX), create=True)
+            try:
+                flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+                outfd = os.open(os.path.basename(GOAL_INBOX), flags, 0o600, dir_fd=inboxfd)
+                try:
+                    info = os.fstat(outfd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or info.st_nlink != 1):
+                        raise ValueError("unsafe goal inbox")
+                    if info.st_size + len(lines) > MAX_INBOX_BYTES:
+                        raise ValueError("goal inbox exceeds size limit")
+                    if stat.S_IMODE(info.st_mode) != 0o600:
+                        os.fchmod(outfd, 0o600)
+                    view = memoryview(lines)
+                    while view:
+                        view = view[os.write(outfd, view):]
+                    os.fsync(outfd)
+                finally:
+                    os.close(outfd)
+            finally:
+                os.close(inboxfd)
+        # Queue first and snapshot second: a crash may replay a goal, but can
+        # never mark an alert delivered before it is durably queued.
+        encoded = json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+        _atomic_write(GOAL_STATE, encoded, 0o600)
+        fcntl.flock(lockfd, fcntl.LOCK_UN)
+    finally:
+        os.close(lockfd)
+    # A desktop notification is the second delivery surface. It is best-effort;
+    # the disk queue above is the source of truth and never depends on this.
+    for goal in new:
+        title = ("GOAL · %s %s-%s %s" % (
+            goal["homeAbbr"], goal["homeScore"], goal["awayScore"], goal["awayAbbr"])
+        )[:160]
+        body = ("%s · %s" % (goal["scorer"], goal["clock"]))[:512]
+        try:
+            subprocess.Popen(["/usr/bin/timeout", "5s", NOTIFICATION_BIN, title, body],
+                             stdout=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+    return new
+
+
+def load_table(force=False):
+    data = standings_raw(force)
+    kids = _objects(data.get("children"), 8)
+    entries = _objects(_mapping(kids[0].get("standings")).get("entries"), 40) if kids else []
+    rows = []
+    for e in entries:
+        stats = {s.get("name"): s for s in _objects(e.get("stats"), 100)}
+
+        def val(name, default=0):
+            s = stats.get(name) or {}
+            v = s.get("value", s.get("displayValue", default))
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return default
+
+        t = _mapping(e.get("team"))
+        rows.append({
+            "id": _bounded(t.get("id"), 32),
+            "name": _bounded(t.get("shortDisplayName") or t.get("displayName", "?"), 100),
+            "full": _bounded(t.get("displayName", "?"), 100),
+            "abbr": _bounded(t.get("abbreviation", "???"), 12),
+            "color": team_color(t),
+            "rank": val("rank", 99),
+            "played": val("gamesPlayed"),
+            "won": val("wins"), "drawn": val("ties"), "lost": val("losses"),
+            "gf": val("pointsFor"), "ga": val("pointsAgainst"),
+            "gd": val("pointDifferential"),
+            "pts": val("points"),
+            "note": _bounded(_mapping(e.get("note")).get("description"), 200),
+        })
+    rows.sort(key=lambda r: r["rank"])
+    return rows
+
+
+def all_teams(force=False):
+    rows = load_table(force)
+    return [{"id": r["id"], "name": r["full"], "abbr": r["abbr"], "color": r["color"]} for r in rows]
+
+
+def team_matches(events, cfg):
+    tid, abbr = str(cfg.get("teamId") or ""), (cfg.get("teamAbbr") or "").upper()
+    if not tid and not abbr:
+        return []
+    out = []
+    for e in events:
+        for side in ("home", "away"):
+            s = e[side]
+            if (tid and s["id"] == tid) or (abbr and s["abbr"].upper() == abbr):
+                out.append(e)
+                break
+    return out
+
+
+def next_match(events, cfg):
+    """The club's live match if there is one, else its next scheduled match."""
+    ms = team_matches(events, cfg)
+    for m in ms:
+        if m["state"] == "in":
+            return m
+    now = datetime.now(timezone.utc)
+    for m in ms:
+        if m["state"] == "pre" and m["kickoff"] >= now - timedelta(minutes=5):
+            return m
+    return None
+
+
+def last_match(events, cfg):
+    done = [m for m in team_matches(events, cfg) if m["state"] == "post"]
+    return done[-1] if done else None
+
+
+def any_live(events):
+    return any(e["state"] == "in" for e in events)
+
+
+# --------------------------------------------------------------------------
+# formatting helpers
+# --------------------------------------------------------------------------
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vlen(s):
+    return len(_ANSI.sub("", s))
+
+
+def clip(s, n):
+    return s if len(s) <= n else (s[: max(0, n - 1)] + "…")
+
+
+class Line:
+    """A styled line that tracks its own visible width."""
+
+    def __init__(self):
+        self.buf = []
+        self.n = 0
+
+    def add(self, text, color=None, bold=False, dim=False, back=None):
+        text = str(text)
+        pre = ""
+        if back:
+            pre += bg(back)
+        if color:
+            pre += fg(color)
+        if bold:
+            pre += BOLD
+        if dim:
+            pre += DIM
+        self.buf.append(pre + text + (RESET if pre else ""))
+        self.n += len(text)
+        return self
+
+    def pad(self, width):
+        if self.n < width:
+            self.buf.append(" " * (width - self.n))
+            self.n = width
+        return self
+
+    def col(self, text, width, color=None, bold=False, dim=False, align="l"):
+        text = clip(str(text), width)
+        space = width - len(text)
+        if align == "r":
+            self.add(" " * space)
+            self.add(text, color, bold, dim)
+        elif align == "c":
+            left = space // 2
+            self.add(" " * left)
+            self.add(text, color, bold, dim)
+            self.add(" " * (space - left))
+        else:
+            self.add(text, color, bold, dim)
+            self.add(" " * space)
+        return self
+
+    def __str__(self):
+        return "".join(self.buf)
+
+
+TZ = None       # None follows the system clock
+
+
+def set_timezone(cfg):
+    """Pin the display zone, so kick-off times read the same on any machine."""
+    global TZ
+    name = (cfg.get("timezone") or "").strip()
+    TZ = None
+    if not name:
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        TZ = ZoneInfo(name)
+    except Exception:
+        TZ = None       # no tzdata — fall back rather than fail
+
+
+def local(dt):
+    return dt.astimezone(TZ) if TZ else dt.astimezone()
+
+
+def tz_label(cfg):
+    lbl = (cfg.get("tzLabel") or "").strip()
+    if lbl:
+        return lbl
+    name = (cfg.get("timezone") or "").strip()
+    if name:
+        return name.rsplit("/", 1)[-1].replace("_", " ")
+    return datetime.now().astimezone().strftime("%Z")
+
+
+def fmt_time(dt, cfg):
+    dt = local(dt)
+    return dt.strftime("%H:%M") if cfg.get("clock24", True) else dt.strftime("%-I:%M %p")
+
+
+def fmt_day(dt):
+    dt = local(dt)
+    today = local(datetime.now(timezone.utc)).date()
+    d = dt.date()
+    if d == today:
+        return "TODAY"
+    if d == today + timedelta(days=1):
+        return "TOMORROW"
+    if d == today - timedelta(days=1):
+        return "YESTERDAY"
+    return dt.strftime("%A %-d %B").upper()
+
+
+def countdown_parts(target):
+    """(days, hours, minutes, seconds, elapsed?) until target."""
+    delta = target - datetime.now(timezone.utc)
+    secs = int(delta.total_seconds())
+    past = secs < 0
+    secs = abs(secs)
+    return secs // 86400, (secs % 86400) // 3600, (secs % 3600) // 60, secs % 60, past
+
+
+def fmt_countdown(target, short=False):
+    d, h, m, s, past = countdown_parts(target)
+    if short:
+        if d:
+            return "%dd %dh" % (d, h)
+        if h:
+            return "%dh %02dm" % (h, m)
+        return "%dm" % m if m else "%ds" % s
+    if d:
+        return "%dd %02dh %02dm %02ds" % (d, h, m, s)
+    if h:
+        return "%02dh %02dm %02ds" % (h, m, s)
+    return "%02dm %02ds" % (m, s)
+
+
+def score_of(m):
+    h, a = m["home"]["score"], m["away"]["score"]
+    if h is None or a is None:
+        return "-", "-"
+    return str(h), str(a)
+
+
+def _is_us(side, cfg):
+    tid, abbr = str(cfg.get("teamId") or ""), (cfg.get("teamAbbr") or "").upper()
+    return (tid and side["id"] == tid) or (abbr and side["abbr"].upper() == abbr)
+
+
+def _ordinal(n):
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+# --------------------------------------------------------------------------
+# widget rendering
+#
+# Deliberately restrained: text carries the hierarchy, not colour. Only three
+# roles are used — plain foreground for content, a dim tone for labels and
+# chrome, and the theme accent for the one thing you opened the widget to see.
+# No per-club colours; twenty clubs' brand reds and purples fight both each
+# other and every Omarchy theme.
+# --------------------------------------------------------------------------
+
+WIDTH = 58                     # the widget's natural column width
+
+RULE = "─"                # ─
+SEP = "·"                 # ·
+DOT = "●"                 # ●
+
+
+def c_text():
+    return T["foreground"]
+
+
+def c_dim():
+    return T["dark_foreground"]
+
+
+def c_faint():
+    return T["lighter_background"]
+
+
+def c_accent():
+    return T["accent"]
+
+
+def section(title, width, pad_top=True):
+    """A dim uppercase label with a hairline running out to the right margin."""
+    out = [""] if pad_top else []
+    ln = Line().add("  ")
+    ln.add(title.upper(), c_dim())
+    ln.add("  ")
+    rule = width - ln.n - 2
+    if rule > 0:
+        ln.add(RULE * rule, c_faint())
+    out.append(str(ln))
+    out.append("")
+    return out
+
+
+def box(title, rows, width, accent=False, meta=""):
+    """An Omarchy surface: restrained border, padded content, strong title."""
+    inner = width - 4
+    top = Line().add("  ╭─ ", c_faint())
+    top.add(title.upper(), c_accent() if accent else c_dim(), bold=accent)
+    if meta:
+        top.add("  " + meta, c_faint())
+    remaining = inner - 3 - len(title) - (len(meta) + 2 if meta else 0)
+    if remaining > 0:
+        top.add(" " + "─" * remaining, c_faint())
+    top.add("╮", c_faint())
+    out = [str(top)]
+    for row in rows:
+        ln = Line().add("  │ ", c_faint())
+        ln.add(row)
+        ln.pad(width - 2).add("│", c_faint())
+        out.append(str(ln))
+    out.append(str(Line().add("  ╰" + "─" * inner + "╯", c_faint())))
+    return out
+
+
+def live_centre(width, cfg, events):
+    """Every live Premier League match, never only the followed club."""
+    live = [m for m in events if m["league"] == LEAGUE and m["state"] == "in"]
+    rows = []
+    name_w = max(12, (width - 28) // 2)
+    for m in live:
+        hs, aws = score_of(m)
+        mine = _is_our_match(m, cfg)
+        ln = Line()
+        ln.col(clip(m["home"]["full"], name_w), name_w,
+               c_accent() if mine else c_text(), bold=mine)
+        ln.col(hs, 3, c_accent(), bold=True, align="r")
+        ln.add("  —  ", c_faint())
+        ln.col(aws, 3, c_accent(), bold=True)
+        ln.col(clip(m["away"]["full"], name_w), name_w,
+               c_accent() if mine else c_text(), bold=mine, align="r")
+        ln.add("  " + (m["clock"] or "LIVE"), T["red"], bold=True)
+        rows.append(str(ln))
+        if m.get("goals"):
+            latest = m["goals"][-1]
+            tag = " (P)" if latest.get("pen") else (" (OG)" if latest.get("own") else "")
+            sub = Line().add("↳ ", c_faint()).add(
+                "%s  %s%s" % (latest.get("player") or "Goal", latest.get("clock") or "", tag),
+                c_dim())
+            rows.append(str(sub))
+    if not rows:
+        upcoming = [m for m in events if m["league"] == LEAGUE and m["state"] == "pre"]
+        if upcoming:
+            m = upcoming[0]
+            ln = Line().add("No match live", c_dim()).add("   ·   ", c_faint())
+            ln.add("Next: %s v %s" % (m["home"]["abbr"], m["away"]["abbr"]), c_text())
+            ln.add("   " + fmt_countdown(m["kickoff"], short=True), c_accent(), bold=True)
+            rows = [str(ln)]
+        else:
+            rows = [str(Line().add("No live or upcoming Premier League matches.", c_dim()))]
+    return box("Live centre", rows, width, accent=bool(live),
+               meta=("%d LIVE" % len(live)) if live else "ALL MATCHES")
+
+
+def full_schedule(width, cfg, events):
+    """Every scheduled Premier League fixture in the full-season window."""
+    matches = [m for m in events if m["league"] == LEAGUE and m["state"] == "pre"]
+    if not matches:
+        return box("Premier League schedule", [str(Line().add("No fixtures scheduled.", c_dim()))],
+                   width, meta=tz_label(cfg))
+    rows, day = [], None
+    name_w = max(12, (width - 27) // 2)
+    for m in matches:
+        label = fmt_day(m["kickoff"])
+        if label != day:
+            if rows:
+                rows.append("")
+            day = label
+            head = Line().add(label, c_accent(), bold=True)
+            head.add("  " + local(m["kickoff"]).strftime("%d %B"), c_faint())
+            rows.append(str(head))
+        mine = _is_our_match(m, cfg)
+        ln = Line()
+        ln.col(fmt_time(m["kickoff"], cfg), 7, c_faint())
+        ln.col(clip(m["home"]["full"], name_w), name_w,
+               c_accent() if mine else c_text(), bold=mine)
+        ln.col("v", 3, c_faint(), align="c")
+        ln.col(clip(m["away"]["full"], name_w), name_w,
+               c_accent() if mine else c_text(), bold=mine)
+        ln.add("  " + fmt_countdown(m["kickoff"], short=True), c_dim())
+        rows.append(str(ln))
+    return box("Premier League schedule", rows, width, meta="%s · %d GAMES" % (tz_label(cfg), len(matches)))
+
+
+def kv(label, value, width, value_color=None, bold=False):
+    ln = Line().add("    ")
+    ln.col(label.upper(), 14, c_dim())
+    ln.add(value, value_color or c_text(), bold=bold)
+    return str(ln)
+
+
+def render_head(width, cfg, rows, err):
+    """Club name, table position and points — the widget's title bar."""
+    club = (cfg.get("team") or "Premier League").upper()
+    ln = Line().add("  ").add(club, c_text(), bold=True)
+    row = next((r for r in rows if _is_us({"id": r["id"], "abbr": r["abbr"]}, cfg)), None)
+    if row:
+        ln.add("   ")
+        ln.add("%d%s" % (row["rank"], _ordinal(row["rank"])), c_dim())
+        ln.add(" %s " % SEP, c_faint())
+        ln.add("%d pt%s" % (row["pts"], "" if row["pts"] == 1 else "s"), c_dim())
+    right = "offline" if err else datetime.now().strftime("%H:%M")
+    if ln.n + len(right) + 4 < width:
+        ln.pad(width - len(right) - 2).add(right, c_faint())
+    out = [str(ln)]
+    out.append(str(Line().add("  ").add(RULE * (width - 4), c_faint())))
+    return out
+
+
+def render_hero(width, cfg, events):
+    """The headline: a live score, or the countdown to the next kick-off."""
+    if not cfg.get("team"):
+        return section("next", width) + [
+            str(Line().add("    ").add("No club set. Press ", c_dim())
+                .add("f", c_accent()).add(" to choose one.", c_dim()))]
+
+    m = next_match(events, cfg)
+    if not m:
+        return section("next", width) + [
+            str(Line().add("    ").add("No fixture scheduled.", c_dim()))]
+
+    live = m["state"] == "in"
+    out = section("live" if live else "next", width)
+
+    us_home = _is_us(m["home"], cfg)
+    opp = m["away"] if us_home else m["home"]
+
+    ln = Line().add("    ")
+    ln.add(cfg["team"], c_text(), bold=True)
+    ln.add("   %s   " % ("vs" if us_home else "at"), c_dim())
+    ln.add(opp["full"], c_text())
+    out.append(str(ln))
+
+    meta = [local(m["kickoff"]).strftime("%a %-d %b"), fmt_time(m["kickoff"], cfg)]
+    if m["venue"]:
+        meta.append(m["venue"])
+    ln = Line().add("    ")
+    for i, part in enumerate(meta):
+        if i:
+            ln.add(" %s " % SEP, c_faint())
+        ln.add(part, c_dim())
+    out.append(str(ln))
+    out.append("")
+
+    if live:
+        hs, as_ = score_of(m)
+        ln = Line().add("    ")
+        ln.add("%s  %s %s %s  %s" % (m["home"]["abbr"], hs, RULE, as_, m["away"]["abbr"]),
+               c_accent(), bold=True)
+        ln.add("     ")
+        ln.add(DOT + " " + (m["clock"] or "live"), c_dim())
+        out.append(str(ln))
+        for g in m["goals"]:
+            side = m["home"]["abbr"] if g["team"] == m["home"]["id"] else m["away"]["abbr"]
+            mark = " (P)" if g["pen"] else (" (OG)" if g["own"] else "")
+            ln = Line().add("    ")
+            ln.col(side, 6, c_faint())
+            ln.add("%s %s%s" % (g["player"], g["clock"], mark), c_dim())
+            out.append(str(ln))
+    else:
+        ln = Line().add("    ")
+        ln.add(fmt_countdown(m["kickoff"]), c_accent(), bold=True)
+        ln.add("   to kick off", c_dim())
+        out.append(str(ln))
+    return out
+
+
+def render_results(width, cfg, events, limit=3):
+    """The club's most recent results, as plain text with no win/loss colour."""
+    played = [m for m in team_matches(events, cfg) if m["state"] == "post"]
+    if not played:
+        return []
+    out = section("recent", width)
+    for m in played[-limit:]:
+        hs, as_ = score_of(m)
+        us_home = _is_us(m["home"], cfg)
+        opp = m["away"] if us_home else m["home"]
+        ours, theirs = (hs, as_) if us_home else (as_, hs)
+        try:
+            outcome = "W" if int(ours) > int(theirs) else ("D" if ours == theirs else "L")
+        except ValueError:
+            outcome = " "
+        ln = Line().add("    ")
+        ln.col(outcome, 3, c_text() if outcome == "W" else c_dim(), bold=outcome == "W")
+        ln.col("%s %s %s" % (ours, RULE, theirs), 8, c_text())
+        ln.col("vs" if us_home else "at", 4, c_faint())
+        ln.add(opp["full"], c_dim())
+        out.append(str(ln))
+    return out
+
+
+def table_slice(rows, cfg, top=5, around=1):
+    """Top of the table plus your club's immediate neighbourhood.
+
+    A widget has no room for twenty rows, and the two things anyone checks are
+    who is leading and who is directly above and below their own club.
+    """
+    if not rows:
+        return []
+    mine = next((i for i, r in enumerate(rows)
+                 if _is_us({"id": r["id"], "abbr": r["abbr"]}, cfg)), None)
+    keep = set(range(min(top, len(rows))))
+    if mine is not None:
+        keep |= {i for i in range(mine - around, mine + around + 1) if 0 <= i < len(rows)}
+    out, last = [], -1
+    for i in sorted(keep):
+        if last >= 0 and i != last + 1:
+            out.append(None)               # gap marker
+        out.append(rows[i])
+        last = i
+    return out
+
+
+def render_table(width, cfg, rows, err, full=False):
+    if not rows:
+        return section("table", width) + [
+            str(Line().add("    ").add("Unavailable" + (" offline" if err else ""), c_dim()))]
+
+    out = section("table", width)
+    hdr = Line().add("    ")
+    hdr.col("", 4)
+    hdr.col("CLUB", width - 30, c_faint())
+    hdr.col("P", 4, c_faint(), align="r")
+    hdr.col("GD", 5, c_faint(), align="r")
+    hdr.col("PTS", 5, c_faint(), align="r")
+    out.append(str(hdr))
+
+    items = rows if full else table_slice(rows, cfg)
+    for r in items:
+        if r is None:
+            out.append(str(Line().add("    ").add("  " + SEP * 3, c_faint())))
+            continue
+        mine = _is_us({"id": r["id"], "abbr": r["abbr"]}, cfg)
+        ln = Line().add("    ")
+        ln.col(str(r["rank"]), 3, c_accent() if mine else c_faint(), align="r")
+        ln.add(" ")
+        ln.col(r["full"], width - 30, c_accent() if mine else c_text(), bold=mine)
+        ln.col(str(r["played"]), 4, c_dim(), align="r")
+        gd = r["gd"]
+        ln.col(("+%d" % gd) if gd > 0 else str(gd), 5, c_dim(), align="r")
+        ln.col(str(r["pts"]), 5, c_text(), bold=True, align="r")
+        out.append(str(ln))
+    return out
+
+
+def render_fixtures(width, cfg, events, cfg_limit=4, club_only=True):
+    """Upcoming matches — the club's own by default, the league's otherwise."""
+    pool = team_matches(events, cfg) if (club_only and cfg.get("team")) else events
+    upcoming = [m for m in pool if m["state"] == "pre"]
+    if not upcoming:
+        return []
+    out = section("upcoming", width)
+    for m in upcoming[:cfg_limit]:
+        ln = Line().add("    ")
+        ln.col(local(m["kickoff"]).strftime("%a %-d %b"), 11, c_dim())
+        ln.col(fmt_time(m["kickoff"], cfg), 7, c_faint())
+        if club_only and cfg.get("team"):
+            us_home = _is_us(m["home"], cfg)
+            opp = m["away"] if us_home else m["home"]
+            ln.col("vs" if us_home else "at", 4, c_faint())
+            ln.col(clip(opp["full"], width - 37), width - 36, c_text())
+        else:
+            ln.col("%s v %s" % (m["home"]["abbr"], m["away"]["abbr"]),
+                   width - 32, c_text())
+        ln.add(fmt_countdown(m["kickoff"], short=True), c_dim())
+        out.append(str(ln))
+    return out
+
+
+def render_league(width, cfg, events, limit=8, expanded=False):
+    """The rest of the league's upcoming matches, grouped by matchday.
+
+    The club section above answers "when do we play"; this answers "what else
+    is on", which is the other half of a Saturday. Times carry an explicit
+    zone label because a kick-off is only meaningful next to one.
+    """
+    ours = {m["id"] for m in team_matches(events, cfg)}
+    upcoming = [m for m in events if m["state"] == "pre" and m["id"] not in ours]
+    if not upcoming:
+        return []
+
+    out = section("around the league  %s  %s" % (SEP, tz_label(cfg)), width)
+    shown = upcoming if expanded else upcoming[:limit]
+    name_w = max(10, (width - 36) // 2)
+    day = None
+    for m in shown:
+        d = fmt_day(m["kickoff"])
+        if d != day:
+            if day is not None:
+                out.append("")
+            day = d
+            out.append(str(Line().add("    ").add(d, c_dim())))
+        ln = Line().add("      ")
+        ln.col(fmt_time(m["kickoff"], cfg), 7, c_faint())
+        ln.col(clip(m["home"]["full"], name_w - 1), name_w, c_text())
+        ln.col("v", 2, c_faint())
+        ln.col(clip(m["away"]["full"], name_w - 1), name_w, c_text())
+        ln.add(fmt_countdown(m["kickoff"], short=True), c_dim())
+        out.append(str(ln))
+
+    rest = len(upcoming) - len(shown)
+    if rest > 0:
+        out.append(str(Line().add("      ")
+                       .add("+%d more  %s  press a" % (rest, SEP), c_faint())))
+    return out
+
+
+def render_today(width, cfg, events, limit=6):
+    """Whatever else is going on in the league right now."""
+    live = [e for e in events if e["state"] == "in"]
+    if not live:
+        return []
+    out = section("elsewhere", width)
+    for m in live[:limit]:
+        hs, as_ = score_of(m)
+        ln = Line().add("    ")
+        ln.col(m["home"]["abbr"], 5, c_text())
+        ln.col("%s %s %s" % (hs, RULE, as_), 8, c_accent())
+        ln.col(m["away"]["abbr"], 6, c_text())
+        ln.add(m["clock"] or "", c_dim())
+        out.append(str(ln))
+    return out
+
+
+def render_footer(width, status, err, last_fetch, full_table, more=False, keys=None):
+    ln = Line().add("  ")
+    if status:
+        ln.add(status, c_accent())
+    elif err:
+        ln.add("offline " + SEP + " cached", c_dim())
+    else:
+        if keys is None:
+            keys = ["r refresh", "t %s" % ("less" if full_table else "table"),
+                    "a fixtures", "f club", "q quit"]
+        keys = list(keys)
+        if more:
+            keys.insert(0, "j/k scroll")
+        ln.add(("  %s  " % SEP).join(keys), c_faint())
+    if last_fetch:
+        age = int(time.time() - last_fetch)
+        right = "%ds ago" % age if age < 90 else "%dm ago" % (age // 60)
+        if ln.n + len(right) + 4 < width:
+            ln.pad(width - len(right) - 2).add(right, c_faint())
+    return [str(Line().add("  ").add(RULE * (width - 4), c_faint())), str(ln)]
+
+
+def compose_league(width, cfg, events, rows, err):
+    """Just the rest of the league — the whole fixture list, nothing else."""
+    out = render_head(width, cfg, rows, err)
+    league = render_league(width, cfg, events, expanded=True)
+    if not league:
+        league = section("around the league", width) + [
+            str(Line().add("    ").add("No upcoming fixtures.", c_dim()))]
+    return out + league
+
+
+def compose(width, cfg, events, rows, err, full_table=False, all_fixtures=True):
+    """League-first dashboard: live now, then every coming fixture."""
+    refresh_theme()
+    out = render_head(width, cfg, rows, err)
+    out += [""] + live_centre(width, cfg, events)
+    out += [""] + render_hero(width, cfg, events)
+    out += [""] + full_schedule(width, cfg, events)
+    out += render_table(width, cfg, rows, err, full=full_table)
+    out += render_results(width, cfg, events)
+    return out
+
+
+# --------------------------------------------------------------------------
+# TUI
+#
+# One scrolling widget rather than tabs: everything you opened it for is on
+# screen at once, and the terminal's own height decides how much you see.
+# --------------------------------------------------------------------------
+
+import threading  # noqa: E402  (kept beside the loop that needs it)
+
+ALT_ON, ALT_OFF = "\x1b[?1049h", "\x1b[?1049l"
+CUR_HIDE, CUR_SHOW = "\x1b[?25l", "\x1b[?25h"
+HOME_POS, CLR_EOL, CLR_EOS = "\x1b[H", "\x1b[K", "\x1b[J"
+
+MAX_WIDTH = 112          # past this the columns just drift apart
+MIN_WIDTH = 52
+
+
+def widget_width(cols):
+    return max(MIN_WIDTH, min(cols - 2, MAX_WIDTH))
+
+
+class App:
+    def __init__(self, cfg, start_picker=False, view="card"):
+        self.cfg = cfg
+        self.start_picker = start_picker
+        self.view = view
+        self.events = []
+        self.rows = []
+        self.err = None
+        self.loading = True
+        self.picker = None          # None, or {"items", "visible", "index", "filter"}
+        self.status = ""
+        self.status_until = 0
+        self.last_fetch = 0
+        self.full_table = False
+        self.all_fixtures = True
+        self.scroll = 0
+        self.page = 10
+        self.running = True
+        self.lock = threading.Lock()
+        self.dirty = True
+        self.refreshing = False
+
+    # -- data ------------------------------------------------------------
+    def refresh(self, force=False):
+        with self.lock:
+            if self.refreshing:
+                return
+            self.refreshing = True
+        def work():
+            try:
+                evs = load_events(force=force)
+                rows = load_table(force=force)
+                with self.lock:
+                    self.events, self.rows, self.err = evs, rows, None
+            except Exception as e:
+                with self.lock:
+                    self.err = str(e)
+            finally:
+                with self.lock:
+                    self.loading = False
+                    self.refreshing = False
+                    self.last_fetch = time.time()
+                    self.dirty = True
+        threading.Thread(target=work, daemon=True).start()
+
+    def maybe_refresh(self):
+        interval = (self.cfg.get("liveRefresh", 25) if any_live(self.events)
+                    else self.cfg.get("idleRefresh", 300))
+        if time.time() - self.last_fetch > interval:
+            self.last_fetch = time.time()   # claim the slot before the thread starts
+            self.refresh(force=True)
+
+    def flash(self, msg, secs=2.5):
+        self.status, self.status_until = msg, time.time() + secs
+        self.dirty = True
+
+    def status_text(self):
+        return self.status if time.time() < self.status_until else ""
+
+    # -- frame -----------------------------------------------------------
+    def frame(self, cols, height):
+        refresh_theme()
+        width = widget_width(cols)
+        avail = max(3, height - 2)          # two lines belong to the footer
+        self.page = avail
+        with self.lock:
+            events, rows, err = list(self.events), list(self.rows), self.err
+
+        if self.picker is not None:
+            body, self.scroll = self.picker_frame(width, avail), 0
+        elif self.loading and not events and not rows:
+            body = render_head(width, self.cfg, rows, err) + [
+                "", str(Line().add("    ").add("Loading…", c_dim()))]
+        elif self.view == "league":
+            body = compose_league(width, self.cfg, events, rows, err)
+        else:
+            body = compose(width, self.cfg, events, rows, err,
+                           self.full_table, self.all_fixtures)
+
+        top = max(0, len(body) - avail)
+        self.scroll = max(0, min(self.scroll, top))
+        view = body[self.scroll:self.scroll + avail]
+        while len(view) < avail:
+            view.append("")
+        keys = (["c full card", "r refresh", "q quit"]
+                if self.view == "league" else None)
+        out = view + render_footer(width, self.status_text(), err,
+                                   self.last_fetch, self.full_table,
+                                   more=top > 0, keys=keys)
+        gap = max(0, (cols - width) // 2)
+        return [(" " * gap + ln if ln else ln) for ln in out]
+
+    def picker_frame(self, width, avail):
+        p = self.picker
+        out = render_head(width, self.cfg, [], None)
+        out += section("choose your club", width)
+        out.append(str(Line().add("    ").add(
+            "type to filter  %s  ↑↓ move  %s  enter select  %s  esc cancel"
+            % (SEP, SEP, SEP), c_dim())))
+        out.append("")
+        if p["filter"]:
+            out.append(str(Line().add("    ").add("/ ", c_faint())
+                           .add(p["filter"], c_accent())))
+            out.append("")
+        items = p["visible"]
+        if not items:
+            out.append(str(Line().add("    ").add("no club matches", c_dim())))
+            return out
+
+        # Keep the highlighted club on screen without scrolling the whole frame.
+        room = max(3, avail - len(out))
+        start = max(0, min(p["index"] - room // 2, len(items) - room))
+        for i, t in enumerate(items[start:start + room], start):
+            on = i == p["index"]
+            ln = Line().add("    ")
+            ln.add("› " if on else "  ", c_accent())
+            ln.add(t["name"], c_accent() if on else c_text(), bold=on)
+            out.append(str(ln))
+        return out
+
+    # -- picker ----------------------------------------------------------
+    def open_picker(self):
+        with self.lock:
+            rows = list(self.rows)
+        if not rows:
+            self.flash("Table not loaded yet — press r")
+            return
+        teams = [{"id": r["id"], "name": r["full"], "abbr": r["abbr"]} for r in rows]
+        teams.sort(key=lambda t: t["name"])
+        self.picker = {"items": teams, "index": 0, "filter": ""}
+        self._filter_picker()
+
+    def _filter_picker(self):
+        p = self.picker
+        f = p["filter"].lower()
+        p["visible"] = [t for t in p["items"]
+                        if f in t["name"].lower() or f in t["abbr"].lower()]
+        p["index"] = max(0, min(p["index"], len(p["visible"]) - 1))
+        self.dirty = True
+
+    def handle_picker_key(self, key):
+        p = self.picker
+        if key in ("\x1b", "\x03"):
+            self.picker = None
+        elif key in ("\r", "\n"):
+            if p["visible"]:
+                t = p["visible"][p["index"]]
+                self.cfg["team"] = t["name"]
+                self.cfg["teamAbbr"] = t["abbr"]
+                self.cfg["teamId"] = t["id"]
+                save_config(self.cfg)
+                self.picker = None
+                self.scroll = 0
+                self.flash("Following %s" % t["name"])
+        elif key == "\x1b[A":
+            p["index"] = max(0, p["index"] - 1)
+        elif key == "\x1b[B":
+            p["index"] = min(len(p["visible"]) - 1, p["index"] + 1)
+        elif key in ("\x7f", "\b"):
+            p["filter"] = p["filter"][:-1]
+            self._filter_picker()
+        elif len(key) == 1 and key.isprintable():
+            p["filter"] += key
+            self._filter_picker()
+        self.dirty = True
+
+    # -- input -----------------------------------------------------------
+    def handle_key(self, key):
+        if self.picker is not None:
+            self.handle_picker_key(key)
+            return
+        if key in ("q", "\x03", "\x1b"):
+            self.running = False
+        elif key == "r":
+            self.flash("Refreshing…")
+            self.refresh(force=True)
+        elif key == "f":
+            self.open_picker()
+        elif key == "t":
+            self.full_table = not self.full_table
+            self.scroll = 0
+        elif key == "a":
+            self.all_fixtures = not self.all_fixtures
+        elif key == "c":
+            self.view = "card" if self.view == "league" else "league"
+            self.scroll = 0
+        elif key in ("j", "\x1b[B"):
+            self.scroll += 1
+        elif key in ("k", "\x1b[A"):
+            self.scroll = max(0, self.scroll - 1)
+        elif key in (" ", "\x1b[6~", "\x06"):
+            self.scroll += max(1, self.page - 2)
+        elif key in ("b", "\x1b[5~", "\x02"):
+            self.scroll = max(0, self.scroll - max(1, self.page - 2))
+        elif key in ("g", "\x1b[H"):
+            self.scroll = 0
+        elif key in ("G", "\x1b[F"):
+            self.scroll = 10 ** 6          # clamped against the real height
+        self.dirty = True
+
+    # -- loop ------------------------------------------------------------
+    def run(self):
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        resized = {"flag": False}
+
+        def on_resize(*_):
+            resized["flag"] = True
+        try:
+            signal.signal(signal.SIGWINCH, on_resize)
+        except (ValueError, AttributeError):
+            pass
+
+        sys.stdout.write(ALT_ON + CUR_HIDE)
+        sys.stdout.flush()
+        try:
+            tty.setraw(fd)
+            self.refresh()
+            last_second = -1
+            picker_pending = self.start_picker
+            while self.running:
+                if resized["flag"]:
+                    resized["flag"] = False
+                    self.dirty = True
+                sec = int(time.time())
+                if sec != last_second:
+                    last_second = sec
+                    self.dirty = True          # keeps the countdown ticking
+                    self.maybe_refresh()
+                if picker_pending and self.rows:
+                    picker_pending = False
+                    self.open_picker()
+                if self.dirty:
+                    self.dirty = False
+                    self.paint()
+                r, _, _ = select.select([sys.stdin], [], [], 0.25)
+                if r:
+                    self.handle_key(read_key(fd))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write(CUR_SHOW + ALT_OFF)
+            sys.stdout.flush()
+
+    def paint(self):
+        try:
+            size = os.get_terminal_size()
+            cols, height = size.columns, size.lines
+        except OSError:
+            cols, height = 80, 30
+        lines = self.frame(cols, height)
+        buf = [HOME_POS]
+        for i, ln in enumerate(lines):
+            if i:
+                buf.append("\r\n")
+            buf.append(ln + CLR_EOL)
+        buf.append(CLR_EOS)
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+
+
+def read_key(fd):
+    ch = os.read(fd, 1).decode("utf-8", "replace")
+    if ch != "\x1b":
+        return ch
+    # Escape sequence: drain whatever arrived with it.
+    r, _, _ = select.select([sys.stdin], [], [], 0.02)
+    if not r:
+        return "\x1b"
+    return ch + os.read(fd, 8).decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------
+# non-interactive output
+# --------------------------------------------------------------------------
+
+def bar_payload(cfg, force=False):
+    """Compact status for the bar widget: live score, or time to kick-off."""
+    try:
+        events = load_events(force=force)
+        err = None
+    except Exception as e:
+        events, err = [], str(e)
+
+    if err and not events:
+        return {"text": "", "state": "error", "team": "",
+                "tooltip": "Premier League: offline"}
+
+    m = next_match(events, cfg) if cfg.get("team") else None
+    if m is None and cfg.get("team"):
+        recent = last_match(events, cfg)
+        if recent:
+            age = datetime.now(timezone.utc) - recent["kickoff"]
+            if age < timedelta(hours=int(cfg.get("resultHours") or 8)):
+                hs, as_ = score_of(recent)
+                rcomp = recent.get("comp") or ""
+                rtag = "" if recent.get("league", LEAGUE) == LEAGUE else " · " + rcomp
+                return {
+                    "state": "post", "team": cfg.get("team", ""), "comp": rcomp,
+                    "text": "%s %s-%s %s FT%s" % (recent["home"]["abbr"], hs, as_,
+                                                  recent["away"]["abbr"], rtag),
+                    "tooltip": "%s %s-%s %s\nFull time%s" % (
+                        recent["home"]["full"], hs, as_, recent["away"]["full"],
+                        ("  ·  " + rcomp) if rcomp else ""),
+                }
+    if m is None:
+        live = [e for e in events if e["state"] == "in"]
+        if live:
+            e = live[0]
+            hs, as_ = score_of(e)
+            return {
+                "state": "in", "team": "",
+                "text": "%s %s-%s %s %s" % (e["home"]["abbr"], hs, as_,
+                                            e["away"]["abbr"], e["clock"] or ""),
+                "tooltip": "%s %s-%s %s · %s" % (e["home"]["full"], hs, as_,
+                                                 e["away"]["full"], e["clock"] or "live"),
+            }
+        nxt = next((e for e in events if e["state"] == "pre"), None)
+        if not nxt:
+            return {"text": "", "state": "idle", "team": "",
+                    "tooltip": "No Premier League fixtures"}
+        return {
+            "state": "pre", "team": "",
+            "text": "%s v %s %s" % (nxt["home"]["abbr"], nxt["away"]["abbr"],
+                                    fmt_countdown(nxt["kickoff"], short=True)),
+            "tooltip": "%s v %s · %s" % (nxt["home"]["full"], nxt["away"]["full"],
+                                         local(nxt["kickoff"]).strftime("%a %-d %b %H:%M")),
+        }
+
+    us_home = _is_us(m["home"], cfg)
+    opp = m["away"] if us_home else m["home"]
+    abbr = cfg.get("teamAbbr") or cfg.get("team", "")[:3].upper()
+    # The league is the default, so it goes unlabelled; a cup or European tie
+    # is named, because "LIV v RMA" means something different in the UCL.
+    comp = m.get("comp") or ""
+    tag = "" if m.get("league", LEAGUE) == LEAGUE else " · " + comp
+
+    if m["state"] == "in":
+        hs, as_ = score_of(m)
+        return {
+            "state": "in", "team": cfg.get("team", ""), "comp": comp,
+            "text": "%s %s-%s %s %s%s" % (m["home"]["abbr"], hs, as_,
+                                          m["away"]["abbr"], m["clock"] or "", tag),
+            "tooltip": "%s %s-%s %s · %s%s" % (m["home"]["full"], hs, as_,
+                                               m["away"]["full"],
+                                               m["clock"] or "live",
+                                               ("\n" + comp) if comp else ""),
+        }
+    return {
+        "state": "pre", "team": cfg.get("team", ""), "comp": comp,
+        "text": "%s %s %s · %s%s" % (abbr, "v" if us_home else "@", opp["abbr"],
+                                     fmt_countdown(m["kickoff"], short=True), tag),
+        "tooltip": "%s %s %s%s\n%s\nKick off in %s" % (
+            abbr, "vs" if us_home else "at", opp["full"],
+            ("  (%s)" % comp) if comp else "",
+            local(m["kickoff"]).strftime("%A %-d %B, %H:%M"),
+            fmt_countdown(m["kickoff"], short=True)),
+    }
+
+
+def overview_payload(cfg, force=False):
+    """Everything the shell pill needs: rotating live scores and next games."""
+    base = bar_payload(cfg, force=force)
+    try:
+        events = load_events(force=False, cfg=cfg)
+    except Exception:
+        events = []
+    live, upcoming = [], []
+    for m in events:
+        if m.get("league") != LEAGUE:
+            continue
+        if m["state"] == "in":
+            hs, aws = score_of(m)
+            live.append({
+                "id": m["id"], "text": "%s %s-%s %s  %s" % (
+                    m["home"]["abbr"], hs, aws, m["away"]["abbr"], m["clock"] or "LIVE"),
+                "home": m["home"]["full"], "away": m["away"]["full"],
+                "homeScore": hs, "awayScore": aws, "clock": m["clock"] or "LIVE",
+            })
+        elif m["state"] == "pre" and len(upcoming) < 20:
+            upcoming.append({
+                "id": m["id"], "home": m["home"]["full"], "away": m["away"]["full"],
+                "homeAbbr": m["home"]["abbr"], "awayAbbr": m["away"]["abbr"],
+                "kickoff": local(m["kickoff"]).strftime("%a %-d %b · %H:%M"),
+            })
+    lines = []
+    if live:
+        lines.append("LIVE NOW")
+        lines.extend("%s" % m["text"] for m in live)
+    if upcoming:
+        lines.append(("\n" if lines else "") + "UPCOMING")
+        lines.extend("%s v %s · %s" % (m["homeAbbr"], m["awayAbbr"], m["kickoff"])
+                     for m in upcoming[:6])
+    base.update({"live": live, "upcoming": upcoming,
+                 "tooltip": "\n".join(lines) if lines else base.get("tooltip", "")})
+    if live:
+        base["state"] = "in"
+    return base
+
+
+PRINT_WIDTH = 72
+
+
+def _emit(lines):
+    for ln in lines:
+        print(ln)
+
+
+def print_card(cfg):
+    """The whole widget, once, without the alternate screen."""
+    try:
+        events, rows, err = load_events(), load_table(), None
+    except Exception as e:
+        events, rows, err = [], [], str(e)
+    _emit(compose(PRINT_WIDTH, cfg, events, rows, err, all_fixtures=True))
+
+
+def print_table(cfg):
+    try:
+        rows, err = load_table(), None
+    except Exception as e:
+        rows, err = [], str(e)
+    _emit(render_table(PRINT_WIDTH, cfg, rows, err, full=True))
+
+
+def print_live(cfg):
+    events = load_events()
+    lines = render_today(PRINT_WIDTH, cfg, events, limit=12)
+    if not lines:
+        print("No Premier League matches in progress.")
+        return
+    _emit(lines)
+
+
+def print_fixtures(cfg, club_only=True):
+    events = load_events()
+    lines = []
+    if club_only and cfg.get("team"):
+        lines += render_fixtures(PRINT_WIDTH, cfg, events, cfg_limit=15,
+                                 club_only=True)
+    lines += render_league(PRINT_WIDTH, cfg, events, expanded=True)
+    if not lines:
+        print("No upcoming fixtures.")
+        return
+    _emit(lines)
+
+
+def print_next(cfg):
+    events = load_events()
+    m = next_match(events, cfg)
+    if not m:
+        if not cfg.get("team"):
+            print("No club set — run: omarchy-pl team <name>")
+        else:
+            print("No upcoming match for %s" % cfg["team"])
+        return
+    us_home = _is_us(m["home"], cfg)
+    opp = m["away"] if us_home else m["home"]
+    print("%s %s %s" % (cfg.get("team", ""), "vs" if us_home else "at", opp["full"]))
+    print("%s  (%s)" % (local(m["kickoff"]).strftime("%A %-d %B, %H:%M"),
+                        m["venue"] or "TBC"))
+    if m["state"] == "in":
+        hs, as_ = score_of(m)
+        print("LIVE  %s %s-%s %s  %s" % (m["home"]["abbr"], hs, as_,
+                                         m["away"]["abbr"], m["clock"] or ""))
+    else:
+        print("Kick off in %s" % fmt_countdown(m["kickoff"]))
+
+
+def set_team(cfg, query):
+    teams = all_teams()
+    q = query.strip().lower()
+    hit = next((t for t in teams
+                if t["name"].lower() == q or t["abbr"].lower() == q), None)
+    if not hit:
+        matches = [t for t in teams if q in t["name"].lower()]
+        if len(matches) == 1:
+            hit = matches[0]
+        elif matches:
+            print("Ambiguous — did you mean:", ", ".join(t["name"] for t in matches))
+            return 1
+    if not hit:
+        print("No Premier League club matches %r. Try: omarchy-pl teams" % query)
+        return 1
+    cfg["team"], cfg["teamAbbr"], cfg["teamId"] = hit["name"], hit["abbr"], hit["id"]
+    save_config(cfg)
+    print("Following %s (%s)" % (hit["name"], hit["abbr"]))
+    return 0
+
+
+USAGE = """omarchy-pl — Premier League scorecard for Omarchy
+
+  omarchy-pl                 open the scorecard (SUPER+P then L)
+  omarchy-pl card            print the scorecard once and exit
+  omarchy-pl live            matches in progress
+  omarchy-pl overview --json all live scores + upcoming schedule for the shell
+  omarchy-pl table           full league table
+  omarchy-pl fixtures        upcoming fixtures (--all for the league only)
+  omarchy-pl league          a window showing only the rest of the league
+  omarchy-pl next            your club's next match + countdown
+  omarchy-pl teams           list clubs
+  omarchy-pl team <name>     follow a club (e.g. "arsenal", "MNC")
+  omarchy-pl pick            choose your club interactively
+  omarchy-pl bar             one line for the status bar
+  omarchy-pl bar --json      JSON payload for the bar widget
+
+Keys in the scorecard:
+  r refresh · t full/short table · a all fixtures · c league-only view · f pick club
+  j/k scroll · space/b page · g/G top/bottom · q quit
+"""
+
+
+def main(argv):
+    args = argv[1:]
+    cmd = args[0] if args else ""
+
+    if cmd in ("-V", "--version", "version"):
+        print("omarchy-pl %s" % VERSION)
+        return 0
+
+    cfg = load_config()
+    set_timezone(cfg)
+
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if cmd in ("bar", "--bar"):
+        p = bar_payload(cfg, force="--force" in args)
+        print(json.dumps(p) if "--json" in args else p["text"])
+        return 0
+    if cmd in ("overview", "scores"):
+        p = overview_payload(cfg, force="--force" in args)
+        print(json.dumps(p) if "--json" in args else p["text"])
+        return 0
+    if cmd == "card":
+        print_card(cfg)
+        return 0
+    if cmd == "table":
+        print_table(cfg)
+        return 0
+    if cmd == "live":
+        print_live(cfg)
+        return 0
+    if cmd in ("fixtures", "upcoming"):
+        print_fixtures(cfg, club_only="--all" not in args)
+        return 0
+    if cmd == "next":
+        print_next(cfg)
+        return 0
+    if cmd == "teams":
+        for t in sorted(all_teams(), key=lambda x: x["name"]):
+            print("%-4s %s" % (t["abbr"], t["name"]))
+        return 0
+    if cmd in ("league", "around"):
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            App(cfg, view="league").run()
+        else:
+            print_fixtures(cfg, club_only=False)
+        return 0
+    if cmd == "pick":
+        if not sys.stdin.isatty():
+            print("omarchy-pl pick needs a terminal")
+            return 1
+        App(cfg, start_picker=True).run()
+        return 0
+    if cmd in ("team", "--team", "--set-team"):
+        if len(args) < 2:
+            print("usage: omarchy-pl team <name>")
+            return 1
+        return set_team(cfg, " ".join(args[1:]))
+    if cmd:
+        print("Unknown command %r\n" % cmd)
+        print(USAGE)
+        return 1
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print_card(cfg)
+        return 0
+    App(cfg).run()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
+    except FetchError as e:
+        print("omarchy-pl: %s" % e, file=sys.stderr)
+        sys.exit(1)

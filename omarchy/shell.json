@@ -1,0 +1,208 @@
+{
+  "bar": {
+    "centerAnchor": "omarchy.clock",
+    "layout": {
+      "center": [
+        {
+          "id": "omarchy.system-update"
+        },
+        {
+          "id": "io.github.twiking.omasettings"
+        },
+        {
+          "id": "omarchy.weather",
+          "unit": "metric"
+        },
+        {
+          "id": "skuthus.hidden-om-bar",
+          "hoverToExpand": true,
+          "autoHideSeconds": 5
+        },
+        {
+          "id": "omarchy.indicators"
+        },
+        {
+          "id": "omarchy.media"
+        },
+        {
+          "id": "omarchy.keyboard-layout"
+        },
+        {
+          "id": "samiul.clock",
+          "format": "ddd d/M hh:mm:ssap",
+          "formatAlt": "d MMMM 'W'ww yyyy",
+          "verticalFormat": "HH\n—\nmm"
+        }
+      ],
+      "left": [
+        {
+          "id": "omarchy.menu"
+        },
+        {
+          "id": "omarchy.workspaces"
+        },
+        {
+          "id": "samiul.launchboard"
+        },
+        {
+          "id": "clipbasket.clipboard"
+        },
+        {
+          "id": "chaz.bar-autohide"
+        },
+        {
+          "id": "io.github.gardnmi.window-shelf"
+        }
+      ],
+      "right": [
+        {
+          "id": "omarchy.tray",
+          "pinned": [],
+          "hidden": [
+            "vlc"
+          ]
+        },
+        {
+          "id": "jankeesvw.notification-center"
+        },
+        {
+          "id": "omapaper"
+        },
+        {
+          "id": "io.github.bjarkimg.android-tv-remote"
+        },
+        {
+          "id": "davidjm.rain",
+          "running": false,
+          "density": 1,
+          "speed": 0.5,
+          "effect": "Aurora",
+          "fps": 15
+        },
+        {
+          "id": "io.github.juancasanueva.plugin-manager"
+        },
+        {
+          "id": "jrmmhm.pocket",
+          "members": "jankeesvw.notification-center, omapaper, io.github.bjarkimg.android-tv-remote, davidjm.rain, io.github.juancasanueva.plugin-manager, omarchy.bluetooth, io.github.r4y-br.quran-motivation, eduardodallecort.weather-radar, davedes.mouse-keybind-settings, andreconde.quattro-corners, io.github.ef-code.wallpaper-explorer, io.github.arhamthedeveloper.mushaf"
+        },
+        {
+          "id": "so.den",
+          "widgets": [
+            "ucmz851.omagpu",
+            "dizziee.system-updates",
+            "io.github.amikeal.battery-plus",
+            "davedes.mouse-keybind-settings",
+            "eduardodallecort.weather-radar",
+            "io.github.r4y-br.quran-motivation",
+            "omarchy.bluetooth",
+            "io.github.ejuro.blow-off-some-steam",
+            "io.github.crsmthw.omageddon"
+          ],
+          "popupMaxHeight": 260,
+          "popupMaxWidth": 121
+        },
+        {
+          "id": "omarchy.agents"
+        },
+        {
+          "id": "io.github.weedwhitesandwine.plug"
+        },
+        {
+          "id": "omarchy.network"
+        },
+        {
+          "id": "omarchy.audio"
+        },
+        {
+          "id": "omarchy.monitor"
+        },
+        {
+          "id": "tomv.battery-usage"
+        },
+        {
+          "id": "modib.activity-monitor",
+          "mode": "icons",
+          "showCpu": false,
+          "showFan": false,
+          "showGpu": false,
+          "showRam": false
+        },
+        {
+          "id": "omarchy.power",
+          "showPercentage": true
+        }
+      ]
+    },
+    "position": "top",
+    "transparent": true
+  },
+  "cloneSourceRestores": [
+    "io.github.sirjul1337.lock-explorer"
+  ],
+  "disabledPlugins": [
+    "omarchy.lock",
+    "omarchy.battery"
+  ],
+  "idle": {
+    "lock": 300,
+    "screensaver": 150
+  },
+  "plugins": [
+    {
+      "id": "io.github.sirjul1337.lock-explorer",
+      "design": "my-rain5"
+    },
+    {
+      "animationStyle": "zoom",
+      "backgroundBlur": 6,
+      "id": "expose.window-overview"
+    },
+    {
+      "id": "bennethon.launchboard"
+    },
+    {
+      "id": "io.github.andyweiboan.launchpad"
+    },
+    {
+      "id": "george.omarkmeter"
+    },
+    {
+      "id": "ucmz851.omagpu"
+    },
+    {
+      "id": "dizziee.system-updates"
+    },
+    {
+      "showPercentage": true,
+      "id": "io.github.amikeal.battery-plus"
+    },
+    {
+      "id": "davedes.mouse-keybind-settings"
+    },
+    {
+      "alertsEnabled": true,
+      "alertRadiusKm": 50,
+      "id": "eduardodallecort.weather-radar"
+    },
+    {
+      "id": "io.github.r4y-br.quran-motivation"
+    },
+    {
+      "id": "omarchy.bluetooth"
+    },
+    {
+      "id": "marcho78.magnify-dock"
+    },
+    {
+      "id": "io.github.cytracon.window-controls"
+    },
+    {
+      "id": "io.github.ejuro.blow-off-some-steam"
+    },
+    {
+      "id": "io.github.crsmthw.omageddon"
+    }
+  ],
+  "version": 1
+}

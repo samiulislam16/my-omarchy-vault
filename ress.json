@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "ressVersion": "1.1.0",
+  "createdAt": "2026-09-18T16:07:00Z",
+  "machine": {
+    "hostname": "omarchy",
+    "user": "samiul",
+    "omarchy": "4.0.0.alpha",
+    "kernel": "7.2.5-3-omarchy"
+  },
+  "categories": [
+    "packages",
+    "config",
+    "omarchy",
+    "webapps",
+    "plugins"
+  ],
+  "counts": {
+    "packages": 173,
+    "config": 25,
+    "themes": 1,
+    "webapps": 5,
+    "plugins": 39,
+    "secrets": 0,
+    "uncaptured": 37,
+    "services": 14
+  }
+}
