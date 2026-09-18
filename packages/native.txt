@@ -131,7 +131,6 @@ system-config-printer
 tensaku
 tesseract
 tesseract-data-eng
-thunar
 tldr
 tlp
 tlp-rdw

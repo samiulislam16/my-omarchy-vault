@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "ressVersion": "1.1.0",
-  "createdAt": "2026-09-18T16:07:00Z",
+  "createdAt": "2026-09-18T16:21:28Z",
   "machine": {
     "hostname": "omarchy",
     "user": "samiul",
@@ -16,7 +16,7 @@
     "plugins"
   ],
   "counts": {
-    "packages": 173,
+    "packages": 172,
     "config": 25,
     "themes": 1,
     "webapps": 5,
