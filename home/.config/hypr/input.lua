@@ -60,5 +60,11 @@ hl.gesture({ fingers = 3, direction = "up", action = function() hl.dispatch(hl.d
 hl.gesture({ fingers = 3, direction = "down", action = function() hl.dispatch(hl.dsp.window.fullscreen({ mode = "maximized", action = "unset" })) end })
 
 -- Four-finger swipe up: toggle Launchpad.
-hl.gesture({ fingers = 4, direction = "up", action = function() hl.dispatch(hl.dsp.exec_cmd("omarchy-shell shell toggle io.github.andyweiboan.launchpad '{}'")) end })
+hl.gesture({ fingers = 4, direction = "up", action = function()
+  hl.dispatch(hl.dsp.exec_cmd("omarchy-shell magnify-dock drawer")) end })
 
+-- Four-finger swipe down: toggle Launchpad.
+--hl.gesture({ fingers = 4, direction = "down", action = function() hl.dispatch(hl.dsp.exec_cmd("notify-send 'Gesture fired'" )) end })
+hl.gesture({ fingers = 4, direction = "down", action = function()
+  hl.dispatch(hl.dsp.exec_cmd(" omarchy-shell shell toggle expose.window-overview"))
+end })   

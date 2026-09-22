@@ -14,3 +14,4 @@ source "$OMARCHY_PATH/default/bash/rc"
 # alias p='python'
 alias app="omarchy-shell shell toggle bennethon.launchboard"
 yt() { yt-dlp -o - "$1" | vlc - ; }   
+fastfetch

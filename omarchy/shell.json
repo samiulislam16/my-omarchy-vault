@@ -159,12 +159,6 @@
       "id": "expose.window-overview"
     },
     {
-      "id": "bennethon.launchboard"
-    },
-    {
-      "id": "io.github.andyweiboan.launchpad"
-    },
-    {
       "id": "george.omarkmeter"
     },
     {
@@ -202,6 +196,9 @@
     },
     {
       "id": "io.github.crsmthw.omageddon"
+    },
+    {
+      "id": "bennethon.launchboard"
     }
   ],
   "version": 1
