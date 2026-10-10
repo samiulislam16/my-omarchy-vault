@@ -10,6 +10,7 @@ bluez
 bluez-tools
 bluez-utils
 bolt
+brave-bin
 brightnessctl
 btop
 btrfs-progs
@@ -19,6 +20,7 @@ cups
 cups-filters
 cups-pk-helper
 ddcutil
+dkms
 docker
 docker-buildx
 docker-compose
@@ -43,6 +45,7 @@ git
 gnome-disk-utility
 gnome-keyring
 gnome-themes-extra
+gobject-introspection
 gpu-screen-recorder
 grim
 gst-plugin-pipewire
@@ -103,6 +106,7 @@ omarchy
 omarchy-keyring
 omarchy-settings
 omawrite
+onnxruntime-cpu
 pacman-contrib
 pamixer
 pinta
@@ -113,7 +117,9 @@ pipewire-pulse
 plocate
 postgresql-libs
 python-gobject
+python-pip
 python-poetry-core
+python-setuptools
 qemu-user-static-binfmt
 qrencode
 qt6-imageformats
@@ -132,9 +138,6 @@ tensaku
 tesseract
 tesseract-data-eng
 tldr
-tlp
-tlp-rdw
-tlpui
 tmux
 tobi-try
 tree-sitter-cli
@@ -148,6 +151,8 @@ ufw-docker
 usage
 usbutils
 uwsm
+v4l2loopback-dkms
+v4l2loopback-utils
 vlc
 vlc-plugins-all
 voxtype-bin

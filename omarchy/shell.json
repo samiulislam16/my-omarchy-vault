@@ -97,7 +97,9 @@
             "io.github.r4y-br.quran-motivation",
             "omarchy.bluetooth",
             "io.github.ejuro.blow-off-some-steam",
-            "io.github.crsmthw.omageddon"
+            "io.github.crsmthw.omageddon",
+            "alanfortlink.camera-effects",
+            "nille.steam-sniper"
           ],
           "popupMaxHeight": 260,
           "popupMaxWidth": 121
@@ -151,7 +153,9 @@
   "plugins": [
     {
       "id": "io.github.sirjul1337.lock-explorer",
-      "design": "my-rain5"
+      "design": "my-rain5",
+      "unlock": "rise",
+      "unlockMs": 600
     },
     {
       "animationStyle": "zoom",
@@ -199,6 +203,43 @@
     },
     {
       "id": "bennethon.launchboard"
+    },
+    {
+      "id": "alanfortlink.camera-effects"
+    },
+    {
+      "id": "nille.steam-sniper"
+    },
+    {
+      "id": "renanmt.switch-magic",
+      "version": 2,
+      "behavior": {
+        "includeSpecial": false,
+        "hoverSelect": false,
+        "showLogo": true
+      },
+      "profiles": {
+        "workspace": {
+          "view": "fan",
+          "preview": "live"
+        },
+        "monitor": {
+          "view": "fan",
+          "preview": "snapshot"
+        },
+        "all": {
+          "view": "carousel",
+          "preview": "hybrid"
+        },
+        "spaces": {
+          "view": "fan",
+          "preview": "hybrid"
+        }
+      },
+      "customViews": [],
+      "views": null,
+      "layouts": null,
+      "appearance": null
     }
   ],
   "version": 1

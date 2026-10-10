@@ -1,6 +1,7 @@
 .config/aether
 .config/autostart
 .config/BraveSoftware
+.config/camera-effects
 .config/celluloid
 .config/chromium
 .config/cliamp

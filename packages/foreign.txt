@@ -1,2 +1,2 @@
-brave-bin
+auto-cpufreq
 paru
